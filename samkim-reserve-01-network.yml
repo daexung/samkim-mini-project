@@ -1,0 +1,616 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'samkim-reserve VPC 10.0.0.0/20 with Dual NAT Gateways for High Availability'
+
+# ============================================================
+# Parameters: 변수화된 입력값 (배포 시 변경 가능)
+# ============================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: samkim-reserve
+    Description: '리소스 이름 prefix (예: samkim-reserve-vpc)'
+
+  MyAdminIP:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: 'Bastion SSH 허용할 관리자 IP (예: 123.456.789.0/32)'
+
+  DBName:
+    Type: String
+    Default: samkimdb
+    Description: 'RDS 데이터베이스 이름'
+
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: 'RDS 마스터 유저 이름'
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: 'RDS 마스터 패스워드 (8자 이상, 배포 시 입력)'
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ----------------------------------------------------------
+  # 1. VPC 생성 (4,096개 IP)
+  # ----------------------------------------------------------
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/20
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  # ----------------------------------------------------------
+  # 2. Internet Gateway 및 연결
+  # ----------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MainVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ----------------------------------------------------------
+  # 3. 서브넷 설계 (10.0.0.0/20 내 배치)
+  # ----------------------------------------------------------
+  # Public Subnets (ALB, Bastion, NAT GW 위치)
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs !Ref 'AWS::Region']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pub-subnet-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs !Ref 'AWS::Region']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pub-subnet-b'
+
+  # App Private Subnets (EKS Node)
+  AppPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.4.0/22
+      AvailabilityZone: !Select [0, !GetAZs !Ref 'AWS::Region']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-subnet-a'
+
+  AppPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.8.0/22
+      AvailabilityZone: !Select [1, !GetAZs !Ref 'AWS::Region']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-subnet-b'
+
+  # DB Private Subnets (RDS)
+  DBPrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [0, !GetAZs !Ref 'AWS::Region']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-a'
+
+  DBPrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: 10.0.13.0/24
+      AvailabilityZone: !Select [1, !GetAZs !Ref 'AWS::Region']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-b'
+
+  # ----------------------------------------------------------
+  # 4. NAT Gateway 2개 및 EIP 2개
+  # ----------------------------------------------------------
+  NatEipA:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gw-a'
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gw-b'
+
+  # ----------------------------------------------------------
+  # 5. 라우팅 테이블
+  # ----------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-public'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  AppRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-app-a'
+
+  AppRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  AppRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-app-b'
+
+  AppRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref AppRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  DBRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-db-isolated'
+
+  # ----------------------------------------------------------
+  # 6. 서브넷 - 라우팅 테이블 연결
+  # ----------------------------------------------------------
+  PublicSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  AppSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppPrivateSubnetA
+      RouteTableId: !Ref AppRouteTableA
+
+  AppSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppPrivateSubnetB
+      RouteTableId: !Ref AppRouteTableB
+
+  DBSubnetAAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DBPrivateSubnetA
+      RouteTableId: !Ref DBRouteTable
+
+  DBSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref DBPrivateSubnetB
+      RouteTableId: !Ref DBRouteTable
+
+  # ----------------------------------------------------------
+  # 7. Security Groups
+  # ----------------------------------------------------------
+
+  # ALB SG: 인터넷 → 80 허용
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'ALB Security Group - HTTP from internet'
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP from internet'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  # Bastion SG: 관리자 IP → 22 허용
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Bastion Security Group - SSH from admin'
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyAdminIP
+          Description: 'SSH from admin IP'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bastion-sg'
+
+  # Lambda SG: RDS 접근용 (아웃바운드만) - App SG보다 먼저 선언
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Lambda Security Group - outbound to RDS'
+      VpcId: !Ref MainVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-lambda-sg'
+
+  # App SG: ALB → 8080, Bastion → 22 허용
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'App Security Group - from ALB and Bastion'
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: 'HTTP from ALB'
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: 'SSH from Bastion'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-sg'
+
+  # RDS SG: App + Lambda → 3306 허용
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'RDS Security Group - MySQL from App and Lambda'
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: 'MySQL from App'
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: 'MySQL from Lambda'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+
+# ----------------------------------------------------------
+  # 8. DB Subnet Group + RDS
+  # ----------------------------------------------------------
+
+  # DB Subnet Group: RDS가 사용할 서브넷 묶음
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: 'samkim-reserve DB Subnet Group'
+      SubnetIds:
+        - !Ref DBPrivateSubnetA
+        - !Ref DBPrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+
+  # RDS Instance: MySQL 8.0, db.t3.micro, Single-AZ
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-rds'
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      AllocatedStorage: '20'
+      StorageType: gp2
+      MultiAZ: false
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds'
+
+  # ----------------------------------------------------------
+  # 9. S3 버킷 (Lambda 분석 결과 저장용)
+  # ----------------------------------------------------------
+  AnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-bucket'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAnalysis
+            Status: Enabled
+            ExpirationInDays: 90
+            Prefix: analysis/
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bucket'
+
+  # ----------------------------------------------------------
+  # 10. Lambda IAM Role
+  # ----------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 분석 결과 저장 권한
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ProjectName}-bucket/analysis/*'
+              # CloudWatch Logs 권한
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ----------------------------------------------------------
+  # 11. Lambda Function
+  # ----------------------------------------------------------
+  AnalysisLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-analysis'
+      Runtime: python3.11
+      Handler: lambda_function.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref AppPrivateSubnetA
+          - !Ref AppPrivateSubnetB
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt RDSInstance.Endpoint.Address
+          DB_USER: !Ref DBUsername
+          DB_PASSWORD: !Ref DBPassword
+          DB_NAME: !Ref DBName
+          S3_BUCKET: !Sub '${ProjectName}-bucket'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-analysis'
+
+  # ----------------------------------------------------------
+  # 12. EventBridge (매일 새벽 2시 자동 실행)
+  # ----------------------------------------------------------
+  AnalysisScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-analysis'
+      Description: '매일 오전 9시 분석 Lambda 실행'
+      ScheduleExpression: 'cron(0 0 * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: AnalysisLambdaTarget
+          Arn: !GetAtt AnalysisLambda.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalysisLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AnalysisScheduleRule.Arn
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+
+  VpcId:
+    Description: 'VPC ID'
+    Value: !Ref MainVPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  PublicSubnetA:
+    Description: 'Public Subnet A ID (AZ-a)'
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub '${ProjectName}-pub-subnet-a'
+
+  PublicSubnetB:
+    Description: 'Public Subnet B ID (AZ-b)'
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub '${ProjectName}-pub-subnet-b'
+
+  AppPrivateSubnetA:
+    Description: 'App Private Subnet A ID (AZ-a)'
+    Value: !Ref AppPrivateSubnetA
+    Export:
+      Name: !Sub '${ProjectName}-app-subnet-a'
+
+  AppPrivateSubnetB:
+    Description: 'App Private Subnet B ID (AZ-b)'
+    Value: !Ref AppPrivateSubnetB
+    Export:
+      Name: !Sub '${ProjectName}-app-subnet-b'
+
+  DBPrivateSubnetA:
+    Description: 'DB Private Subnet A ID (AZ-a)'
+    Value: !Ref DBPrivateSubnetA
+    Export:
+      Name: !Sub '${ProjectName}-db-subnet-a'
+
+  DBPrivateSubnetB:
+    Description: 'DB Private Subnet B ID (AZ-b)'
+    Value: !Ref DBPrivateSubnetB
+    Export:
+      Name: !Sub '${ProjectName}-db-subnet-b'
+
+  AlbSgId:
+    Description: 'ALB Security Group ID'
+    Value: !Ref AlbSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-alb-sg-id'
+
+  BastionSgId:
+    Description: 'Bastion Security Group ID'
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-bastion-sg-id'
+
+  AppSgId:
+    Description: 'App Security Group ID'
+    Value: !Ref AppSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-app-sg-id'
+
+  RdsSgId:
+    Description: 'RDS Security Group ID'
+    Value: !Ref RdsSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-rds-sg-id'
+
+  LambdaSgId:
+    Description: 'Lambda Security Group ID'
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-lambda-sg-id'
+
+  RDSEndpoint:
+    Description: 'RDS Endpoint Address'
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-rds-endpoint'
+
+  RDSPort:
+    Description: 'RDS Endpoint Port'
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-rds-port'
+
+  AnalysisBucketName:
+    Description: 'S3 Bucket Name for Lambda analysis output'
+    Value: !Ref AnalysisBucket
+    Export:
+      Name: !Sub '${ProjectName}-bucket-name'
+
+  LambdaFunctionName:
+    Description: 'Lambda Function Name'
+    Value: !Ref AnalysisLambda
+    Export:
+      Name: !Sub '${ProjectName}-lambda-name'
